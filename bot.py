@@ -21,7 +21,7 @@ FIELDS: List[Tuple[str, str]] = [
     ("extra_section", "Доп секция (да/нет)"),
 ]
 
-# Варианты для быстрых кнопок (если нет нужного — жми "Ввести вручную")
+# Быстрые варианты кнопками (если нет нужного — "Ввести вручную")
 OPTIONS = {
     "height_mm": [1600, 1850, 2200, 2350, 2500, 2550, 2750, 3000, 3100],
     "width_mm": [700, 1000, 1200, 1500],
@@ -40,10 +40,11 @@ CB_MENU = "menu"
 CB_RESET = "reset_all"
 CB_BACK = "back_field"
 CB_CANCEL = "cancel_edit"
+CB_SET_COUNT = "set_count"
 
-# Для pick/manual
-CB_PICK_PREFIX = "pick:"      # pick:{field}:{value}
-CB_MANUAL_PREFIX = "manual:"  # manual:{field}
+CB_PICK_PREFIX = "pick:"       # pick:{field}:{value}
+CB_MANUAL_PREFIX = "manual:"   # manual:{field}
+CB_COUNT_PREFIX = "count:"     # count:{n}
 
 # Состояния диалога
 ASK_VALUE = 1
@@ -77,15 +78,21 @@ def get_user_state(db: Dict[str, Dict], user_id: int) -> Dict[str, Any]:
     if uid not in db:
         # editing: {"idx": int, "field_i": int}
         # manual: bool (ожидаем ручной ввод текстом)
-        db[uid] = {"sections": [], "editing": None, "manual": False}
-    # гарантируем ключи на старых данных
+        # target_count: int (если выбрал кол-во секций заранее)
+        db[uid] = {"sections": [], "editing": None, "manual": False, "target_count": 0}
+
+    # на случай старых данных:
     if "manual" not in db[uid]:
         db[uid]["manual"] = False
+    if "target_count" not in db[uid]:
+        db[uid]["target_count"] = 0
     return db[uid]
 
 
+# ---------- Keyboards ----------
 def main_menu() -> InlineKeyboardMarkup:
     kb = [
+        [InlineKeyboardButton("🧱 Задать кол-во секций", callback_data=CB_SET_COUNT)],
         [InlineKeyboardButton("➕ Добавить секцию", callback_data=CB_ADD)],
         [InlineKeyboardButton("📋 Секции", callback_data=CB_LIST)],
         [InlineKeyboardButton("✅ Применить", callback_data=CB_APPLY)],
@@ -112,6 +119,60 @@ def list_kb(sections_count: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(kb)
 
 
+def finish_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Новый расчёт", callback_data=CB_RESET)],
+        [InlineKeyboardButton("⬅️ В меню", callback_data=CB_MENU)],
+    ])
+
+
+def manual_only_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⬅️ Назад", callback_data=CB_BACK),
+            InlineKeyboardButton("⛔️ Отмена", callback_data=CB_CANCEL),
+        ]
+    ])
+
+
+def input_kb(field_key: str) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    opts = OPTIONS.get(field_key, [])
+
+    # варианты (2 колонки)
+    row: List[InlineKeyboardButton] = []
+    for v in opts:
+        row.append(InlineKeyboardButton(str(v), callback_data=f"{CB_PICK_PREFIX}{field_key}:{v}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton("✍️ Ввести вручную", callback_data=f"{CB_MANUAL_PREFIX}{field_key}")])
+    rows.append([
+        InlineKeyboardButton("⬅️ Назад", callback_data=CB_BACK),
+        InlineKeyboardButton("⛔️ Отмена", callback_data=CB_CANCEL),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def count_kb() -> InlineKeyboardMarkup:
+    nums = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    rows: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for n in nums:
+        row.append(InlineKeyboardButton(str(n), callback_data=f"{CB_COUNT_PREFIX}{n}"))
+        if len(row) == 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=CB_MENU)])
+    return InlineKeyboardMarkup(rows)
+
+
+# ---------- Helpers ----------
 def format_section(s: Section, idx: int) -> str:
     return (
         f"**Секция {idx+1}**\n"
@@ -137,10 +198,9 @@ def parse_bool_ru(text: str) -> Optional[bool]:
 def calc_price(sections: List[Section]) -> float:
     """
     TODO: сюда вставим твою реальную формулу.
-    Ниже — пример-заглушка: считаем "площадь полок" (ширина*глубина*уровни) в м²
-    и умножаем на условную цену 1000 руб/м².
+    Ниже — пример-заглушка.
     """
-    price_per_m2 = 1000.0  # заменишь на свои правила/прайс
+    price_per_m2 = 1000.0
     total_m2 = 0.0
     for s in sections:
         m2 = (s.width_mm / 1000.0) * (s.depth_mm / 1000.0) * max(s.levels_count, 0)
@@ -148,51 +208,11 @@ def calc_price(sections: List[Section]) -> float:
     return total_m2 * price_per_m2
 
 
-# ---------- UI for step input (pick/manual/back/cancel) ----------
-def input_kb(field_key: str) -> InlineKeyboardMarkup:
-    rows: List[List[InlineKeyboardButton]] = []
-    opts = OPTIONS.get(field_key, [])
-
-    # варианты (2 колонки)
-    row: List[InlineKeyboardButton] = []
-    for v in opts:
-        row.append(InlineKeyboardButton(str(v), callback_data=f"{CB_PICK_PREFIX}{field_key}:{v}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-
-    rows.append([InlineKeyboardButton("✍️ Ввести вручную", callback_data=f"{CB_MANUAL_PREFIX}{field_key}")])
-    rows.append([
-        InlineKeyboardButton("⬅️ Назад", callback_data=CB_BACK),
-        InlineKeyboardButton("⛔️ Отмена", callback_data=CB_CANCEL),
-    ])
-    return InlineKeyboardMarkup(rows)
-
-
-def finish_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Новый расчёт", callback_data=CB_RESET)],
-        [InlineKeyboardButton("⬅️ В меню", callback_data=CB_MENU)],
-    ])
-
-
-def manual_only_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("⬅️ Назад", callback_data=CB_BACK),
-            InlineKeyboardButton("⛔️ Отмена", callback_data=CB_CANCEL),
-        ]
-    ])
-
-
-def ask_text(idx: int, field_label: str, action_title: str) -> str:
-    return f"{action_title} секцию {idx+1}.\n\nВыбери или введи: **{field_label}**"
+def ask_text(idx: int, field_label: str, action_title: str, total: int) -> str:
+    return f"{action_title} секцию {idx+1} из {total}.\n\nВыбери или введи: **{field_label}**"
 
 
 def current_step(db: Dict[str, Dict], user_id: int) -> Optional[Tuple[int, int, str, str]]:
-    """Возвращает (idx, field_i, key, label) или None."""
     st = get_user_state(db, user_id)
     editing = st.get("editing")
     if not editing:
@@ -205,13 +225,38 @@ def current_step(db: Dict[str, Dict], user_id: int) -> Optional[Tuple[int, int, 
     return idx, field_i, key, label
 
 
-# ---------- Handlers ----------
+def total_sections(st: Dict[str, Any]) -> int:
+    return len(st["sections"])
+
+
+# ---------- Commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Калькулятор стеллажей.\n\nВыбери действие:", reply_markup=main_menu()
     )
 
 
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = load_db()
+    st = get_user_state(db, update.effective_user.id)
+    st["editing"] = None
+    st["manual"] = False
+    save_db(db)
+    await update.message.reply_text("Выбери действие:", reply_markup=main_menu())
+
+
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = load_db()
+    st = get_user_state(db, update.effective_user.id)
+    st["sections"] = []
+    st["editing"] = None
+    st["manual"] = False
+    st["target_count"] = 0
+    save_db(db)
+    await update.message.reply_text("✅ Сбросил расчёт. Выбери действие:", reply_markup=main_menu())
+
+
+# ---------- Menu click handler ----------
 async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -219,7 +264,6 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = load_db()
     st = get_user_state(db, q.from_user.id)
 
-    # Меню
     if q.data == CB_MENU:
         st["editing"] = None
         st["manual"] = False
@@ -227,16 +271,15 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Выбери действие:", reply_markup=main_menu())
         return ConversationHandler.END
 
-    # Новый расчёт: очищаем всё
     if q.data == CB_RESET:
         st["sections"] = []
         st["editing"] = None
         st["manual"] = False
+        st["target_count"] = 0
         save_db(db)
         await q.edit_message_text("✅ Сбросил расчёт. Выбери действие:", reply_markup=main_menu())
         return ConversationHandler.END
 
-    # Отмена редактирования (во время ввода)
     if q.data == CB_CANCEL:
         st["editing"] = None
         st["manual"] = False
@@ -244,23 +287,27 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Ок, отменил. Выбери действие:", reply_markup=main_menu())
         return ConversationHandler.END
 
-    # Добавить секцию
+    if q.data == CB_SET_COUNT:
+        await q.edit_message_text("Сколько секций нужно?", reply_markup=count_kb())
+        return ConversationHandler.END
+
     if q.data == CB_ADD:
+        # добавляем ОДНУ секцию и начинаем её заполнять
         st["sections"].append(asdict(Section()))
         idx = len(st["sections"]) - 1
         st["editing"] = {"idx": idx, "field_i": 0}
         st["manual"] = False
+        st["target_count"] = 0
         save_db(db)
 
         field_key, field_label = FIELDS[0]
         await q.edit_message_text(
-            ask_text(idx, field_label, "Добавляем"),
+            ask_text(idx, field_label, "Добавляем", total_sections(st)),
             parse_mode="Markdown",
             reply_markup=input_kb(field_key),
         )
         return ASK_VALUE
 
-    # Список секций
     if q.data == CB_LIST:
         cnt = len(st["sections"])
         if cnt == 0:
@@ -269,7 +316,6 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Секции:", reply_markup=list_kb(cnt))
         return ConversationHandler.END
 
-    # Открыть секцию
     if q.data.startswith("open:"):
         idx = int(q.data.split(":")[1])
         s = Section(**st["sections"][idx])
@@ -280,7 +326,6 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    # Удалить секцию
     if q.data.startswith("del:"):
         idx = int(q.data.split(":")[1])
         if 0 <= idx < len(st["sections"]):
@@ -289,22 +334,21 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Удалено. Выбери действие:", reply_markup=main_menu())
         return ConversationHandler.END
 
-    # Редактировать секцию (с нуля по полям)
     if q.data.startswith("edit:"):
         idx = int(q.data.split(":")[1])
         st["editing"] = {"idx": idx, "field_i": 0}
         st["manual"] = False
+        st["target_count"] = 0
         save_db(db)
 
         field_key, field_label = FIELDS[0]
         await q.edit_message_text(
-            ask_text(idx, field_label, "Редактируем"),
+            ask_text(idx, field_label, "Редактируем", total_sections(st)),
             parse_mode="Markdown",
             reply_markup=input_kb(field_key),
         )
         return ASK_VALUE
 
-    # Применить (итог)
     if q.data == CB_APPLY:
         sections = [Section(**x) for x in st["sections"]]
         if not sections:
@@ -324,6 +368,31 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ---------- Choose sections count ----------
+async def on_count_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    n = int(q.data.split(":")[1])
+
+    db = load_db()
+    st = get_user_state(db, q.from_user.id)
+
+    st["sections"] = [asdict(Section()) for _ in range(n)]
+    st["target_count"] = n
+    st["editing"] = {"idx": 0, "field_i": 0}
+    st["manual"] = False
+    save_db(db)
+
+    field_key, field_label = FIELDS[0]
+    await q.edit_message_text(
+        ask_text(0, field_label, "Заполним", total_sections(st)),
+        parse_mode="Markdown",
+        reply_markup=input_kb(field_key),
+    )
+    return ASK_VALUE
+
+
 # ---------- Pick value button ----------
 async def on_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -337,25 +406,24 @@ async def on_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     idx, field_i, key, label = step
+    total = total_sections(st)
 
-    # pick:{field}:{value}
-    data = q.data[len(CB_PICK_PREFIX):]
+    data = q.data[len(CB_PICK_PREFIX):]  # {field}:{value}
     field_key, value = data.split(":", 1)
 
-    # если кнопка не для текущего поля — покажем текущую клавиатуру
     if field_key != key:
         await q.edit_message_text(
-            ask_text(idx, label, "Продолжаем"),
+            ask_text(idx, label, "Продолжаем", total),
             parse_mode="Markdown",
             reply_markup=input_kb(key),
         )
         return ASK_VALUE
 
-    # записываем значение
+    # запись значения
     if key == "extra_section":
         b = parse_bool_ru(value)
         if b is None:
-            await q.edit_message_text("Выбери **да** или **нет**:", reply_markup=input_kb(key))
+            await q.edit_message_text("Выбери **да** или **нет**:", reply_markup=input_kb(key), parse_mode="Markdown")
             return ASK_VALUE
         st["sections"][idx][key] = b
     else:
@@ -365,17 +433,33 @@ async def on_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("Некорректное значение. Выбери снова:", reply_markup=input_kb(key))
             return ASK_VALUE
 
-    # следующий шаг
     st["manual"] = False
+
+    # следующий шаг
     field_i += 1
     if field_i >= len(FIELDS):
+        # секция готова -> следующая секция или завершение
+        next_idx = idx + 1
+        if next_idx < len(st["sections"]):
+            st["editing"] = {"idx": next_idx, "field_i": 0}
+            st["manual"] = False
+            save_db(db)
+
+            first_key, first_label = FIELDS[0]
+            await q.edit_message_text(
+                f"✅ Секция {idx+1} готова.\n\n"
+                + ask_text(next_idx, first_label, "Заполним", total_sections(st)),
+                parse_mode="Markdown",
+                reply_markup=input_kb(first_key),
+            )
+            return ASK_VALUE
+
         st["editing"] = None
+        st["manual"] = False
         save_db(db)
-        s = Section(**st["sections"][idx])
         await q.edit_message_text(
-            "Готово ✅\n\n" + format_section(s, idx),
-            parse_mode="Markdown",
-            reply_markup=main_menu()
+            f"✅ Все секции заполнены ({len(st['sections'])}).\n\nТеперь нажми «✅ Применить» в меню.",
+            reply_markup=main_menu(),
         )
         return ConversationHandler.END
 
@@ -384,7 +468,7 @@ async def on_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     next_key, next_label = FIELDS[field_i]
     await q.edit_message_text(
-        ask_text(idx, next_label, "Продолжаем"),
+        ask_text(idx, next_label, "Продолжаем", total),
         parse_mode="Markdown",
         reply_markup=input_kb(next_key),
     )
@@ -405,11 +489,10 @@ async def on_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     idx, field_i, key, label = step
 
-    # manual:{field}
     field_key = q.data[len(CB_MANUAL_PREFIX):]
     if field_key != key:
         await q.edit_message_text(
-            ask_text(idx, label, "Продолжаем"),
+            ask_text(idx, label, "Продолжаем", total_sections(st)),
             parse_mode="Markdown",
             reply_markup=input_kb(key),
         )
@@ -439,12 +522,11 @@ async def on_back_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     idx = editing["idx"]
     field_i = editing["field_i"]
+    total = total_sections(st)
 
-    # назад на поле
     if field_i > 0:
         field_i -= 1
     else:
-        # если это первое поле — остаёмся на первом
         field_i = 0
 
     editing["field_i"] = field_i
@@ -453,7 +535,7 @@ async def on_back_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     key, label = FIELDS[field_i]
     await q.edit_message_text(
-        ask_text(idx, label, "Возврат к"),
+        ask_text(idx, label, "Возврат к", total),
         parse_mode="Markdown",
         reply_markup=input_kb(key),
     )
@@ -464,18 +546,21 @@ async def on_back_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = load_db()
     st = get_user_state(db, update.effective_user.id)
-
     editing = st.get("editing")
     if not editing:
         await update.message.reply_text("Выбери действие:", reply_markup=main_menu())
         return ConversationHandler.END
 
-    # Если manual не включён — просим выбрать кнопками
+    step = current_step(db, update.effective_user.id)
+    if not step:
+        await update.message.reply_text("Выбери действие:", reply_markup=main_menu())
+        return ConversationHandler.END
+
+    idx, field_i, key, label = step
+    total = total_sections(st)
+
+    # Если manual не включён — просим выбирать кнопками
     if not st.get("manual", False):
-        idx, field_i, key, label = current_step(db, update.effective_user.id) or (None, None, None, None)
-        if key is None:
-            await update.message.reply_text("Выбери действие:", reply_markup=main_menu())
-            return ConversationHandler.END
         await update.message.reply_text(
             f"Выбери значение кнопкой или нажми «Ввести вручную» для поля: **{label}**",
             parse_mode="Markdown",
@@ -483,23 +568,17 @@ async def on_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ASK_VALUE
 
-    idx = editing["idx"]
-    field_i = editing["field_i"]
-    if idx >= len(st["sections"]):
-        st["editing"] = None
-        st["manual"] = False
-        save_db(db)
-        await update.message.reply_text("Секция не найдена. Меню:", reply_markup=main_menu())
-        return ConversationHandler.END
-
-    key, label = FIELDS[field_i]
     raw = update.message.text.strip()
 
     # Валидация
     if key == "extra_section":
         b = parse_bool_ru(raw)
         if b is None:
-            await update.message.reply_text("Введи **да** или **нет**.", parse_mode="Markdown", reply_markup=manual_only_kb())
+            await update.message.reply_text(
+                "Введи **да** или **нет**.",
+                parse_mode="Markdown",
+                reply_markup=manual_only_kb()
+            )
             return ASK_VALUE
         st["sections"][idx][key] = b
     else:
@@ -509,22 +588,38 @@ async def on_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raise ValueError
             st["sections"][idx][key] = val
         except ValueError:
-            await update.message.reply_text("Нужно целое число (например: 2000).", reply_markup=manual_only_kb())
+            await update.message.reply_text(
+                "Нужно целое число (например: 2000).",
+                reply_markup=manual_only_kb()
+            )
             return ASK_VALUE
 
-    # Ручной ввод закончили — возвращаемся к кнопкам дальше
     st["manual"] = False
 
     # Следующее поле
     field_i += 1
     if field_i >= len(FIELDS):
+        next_idx = idx + 1
+        if next_idx < len(st["sections"]):
+            st["editing"] = {"idx": next_idx, "field_i": 0}
+            st["manual"] = False
+            save_db(db)
+
+            first_key, first_label = FIELDS[0]
+            await update.message.reply_text(
+                f"✅ Секция {idx+1} готова.\n\n"
+                + ask_text(next_idx, first_label, "Заполним", total_sections(st)),
+                parse_mode="Markdown",
+                reply_markup=input_kb(first_key),
+            )
+            return ASK_VALUE
+
         st["editing"] = None
+        st["manual"] = False
         save_db(db)
-        s = Section(**st["sections"][idx])
         await update.message.reply_text(
-            "Готово ✅\n\n" + format_section(s, idx),
-            parse_mode="Markdown",
-            reply_markup=main_menu()
+            f"✅ Все секции заполнены ({len(st['sections'])}).\n\nТеперь нажми «✅ Применить» в меню.",
+            reply_markup=main_menu(),
         )
         return ConversationHandler.END
 
@@ -533,7 +628,7 @@ async def on_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     next_key, next_label = FIELDS[field_i]
     await update.message.reply_text(
-        ask_text(idx, next_label, "Теперь выбери/введи"),
+        ask_text(idx, next_label, "Теперь выбери/введи", total),
         parse_mode="Markdown",
         reply_markup=input_kb(next_key),
     )
@@ -543,10 +638,15 @@ async def on_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def build_app(token: str) -> Application:
     app = Application.builder().token(token).build()
 
+    # Команды (кнопки-команды в Telegram можно включить через BotFather /setcommands)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu_cmd))
+    app.add_handler(CommandHandler("reset", reset_cmd))
+
     conv = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
-            # Важно: сначала узкие обработчики, потом общий menu
+            CallbackQueryHandler(on_count_pick, pattern=r"^count:"),
             CallbackQueryHandler(on_pick, pattern=r"^pick:"),
             CallbackQueryHandler(on_manual, pattern=r"^manual:"),
             CallbackQueryHandler(on_back_field, pattern=r"^back_field$"),
@@ -554,10 +654,11 @@ def build_app(token: str) -> Application:
         ],
         states={
             ASK_VALUE: [
+                CallbackQueryHandler(on_count_pick, pattern=r"^count:"),
                 CallbackQueryHandler(on_pick, pattern=r"^pick:"),
                 CallbackQueryHandler(on_manual, pattern=r"^manual:"),
                 CallbackQueryHandler(on_back_field, pattern=r"^back_field$"),
-                CallbackQueryHandler(on_menu_click),  # для cancel/menu и т.п.
+                CallbackQueryHandler(on_menu_click),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_value),
             ],
         },
