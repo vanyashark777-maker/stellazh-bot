@@ -1,7 +1,7 @@
 import json
 import os
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
@@ -42,21 +42,6 @@ class Section:
     extra_section: bool = False
 
 
-# ---------- SAFE EDIT (фикс Message is not modified) ----------
-async def safe_edit(q, text: str, reply_markup=None, parse_mode=None):
-    """
-    Telegram кидает BadRequest: Message is not modified
-    если пытаемся отредактировать сообщение тем же самым текстом и теми же кнопками.
-    Этот хелпер гасит именно эту ошибку, чтобы бот не падал.
-    """
-    try:
-        await q.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-    except BadRequest as e:
-        if "Message is not modified" in str(e):
-            return
-        raise
-
-
 def load_db() -> Dict[str, Dict]:
     if not os.path.exists(DATA_FILE):
         return {}
@@ -72,7 +57,7 @@ def save_db(db: Dict[str, Dict]) -> None:
 def get_user_state(db: Dict[str, Dict], user_id: int) -> Dict:
     uid = str(user_id)
     if uid not in db:
-        db[uid] = {"sections": [], "editing": None}  # editing: {"idx":int, "field_i":int}
+        db[uid] = {"sections": [], "editing": None}  # editing: {"idx": int, "field_i": int}
     return db[uid]
 
 
@@ -81,6 +66,19 @@ def main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("➕ Добавить секцию", callback_data="add")],
         [InlineKeyboardButton("📋 Секции", callback_data="list")],
         [InlineKeyboardButton("✅ Применить", callback_data="apply")],
+        [InlineKeyboardButton("🔄 Сброс", callback_data="reset")],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+
+def input_menu_kb() -> InlineKeyboardMarkup:
+    # Показываем при каждом вопросе ввода значения
+    kb = [
+        [
+            InlineKeyboardButton("⬅️ Назад", callback_data="step_back"),
+            InlineKeyboardButton("🏠 Меню", callback_data="menu"),
+        ],
+        [InlineKeyboardButton("🔄 Сброс", callback_data="reset")],
     ]
     return InlineKeyboardMarkup(kb)
 
@@ -128,11 +126,9 @@ def parse_bool_ru(text: str) -> Optional[bool]:
 
 def calc_price(sections: List[Section]) -> float:
     """
-    TODO: сюда вставим твою реальную формулу.
-    Ниже — пример-заглушка: считаем "площадь полок" (ширина*глубина*уровни) в м²
-    и умножаем на условную цену 1000 руб/м².
+    Заглушка-формула: площадь полок (ширина*глубина*уровни) в м² * 1000 руб/м².
     """
-    price_per_m2 = 1000.0  # заменишь на свои правила/прайс
+    price_per_m2 = 1000.0
     total_m2 = 0.0
     for s in sections:
         m2 = (s.width_mm / 1000.0) * (s.depth_mm / 1000.0) * max(s.levels_count, 0)
@@ -140,32 +136,101 @@ def calc_price(sections: List[Section]) -> float:
     return total_m2 * price_per_m2
 
 
+async def safe_edit(
+    q,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+    parse_mode: Optional[str] = None,
+) -> None:
+    """
+    Защита от ошибки:
+    telegram.error.BadRequest: Message is not modified
+    """
+    try:
+        await q.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except BadRequest as e:
+        msg = str(e).lower()
+        if "message is not modified" in msg:
+            # Ничего страшного — просто игнорируем
+            return
+        raise
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /start всегда возвращает в меню и сбрасывает текущий ввод (чтобы не путаться)
+    db = load_db()
+    st = get_user_state(db, update.effective_user.id)
+    st["editing"] = None
+    save_db(db)
+
     await update.message.reply_text(
-        "Калькулятор стеллажей.\n\nВыбери действие:", reply_markup=main_menu()
+        "Калькулятор стеллажей.\n\nВыбери действие:",
+        reply_markup=main_menu(),
     )
+    return ConversationHandler.END
 
 
 async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
     db = load_db()
     st = get_user_state(db, q.from_user.id)
 
+    # --- Общие кнопки ---
     if q.data == "menu":
+        st["editing"] = None
+        save_db(db)
         await safe_edit(q, "Выбери действие:", reply_markup=main_menu())
         return ConversationHandler.END
 
+    if q.data == "reset":
+        st["sections"] = []
+        st["editing"] = None
+        save_db(db)
+        await safe_edit(q, "Сбросил расчёт ✅\nВыбери действие:", reply_markup=main_menu())
+        return ConversationHandler.END
+
+    if q.data == "step_back":
+        editing = st.get("editing")
+        if not editing:
+            await safe_edit(q, "Выбери действие:", reply_markup=main_menu())
+            return ConversationHandler.END
+
+        # откат на предыдущее поле
+        if editing["field_i"] > 0:
+            editing["field_i"] -= 1
+            save_db(db)
+
+        idx = editing["idx"]
+        if idx >= len(st["sections"]):
+            st["editing"] = None
+            save_db(db)
+            await safe_edit(q, "Секция не найдена. Меню:", reply_markup=main_menu())
+            return ConversationHandler.END
+
+        _, field_label = FIELDS[editing["field_i"]]
+        await safe_edit(
+            q,
+            f"Ок, шаг назад.\n\nВведи снова: **{field_label}**",
+            parse_mode="Markdown",
+            reply_markup=input_menu_kb(),
+        )
+        return ASK_VALUE
+
+    # --- Меню ---
     if q.data == "add":
         st["sections"].append(asdict(Section()))
         idx = len(st["sections"]) - 1
         st["editing"] = {"idx": idx, "field_i": 0}
         save_db(db)
+
         _, field_label = FIELDS[0]
         await safe_edit(
             q,
             f"Добавляем секцию {idx+1}.\n\nВведи: **{field_label}**",
             parse_mode="Markdown",
+            reply_markup=input_menu_kb(),
         )
         return ASK_VALUE
 
@@ -179,6 +244,9 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if q.data.startswith("open:"):
         idx = int(q.data.split(":")[1])
+        if not (0 <= idx < len(st["sections"])):
+            await safe_edit(q, "Секция не найдена.", reply_markup=main_menu())
+            return ConversationHandler.END
         s = Section(**st["sections"][idx])
         await safe_edit(
             q,
@@ -192,19 +260,25 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         idx = int(q.data.split(":")[1])
         if 0 <= idx < len(st["sections"]):
             st["sections"].pop(idx)
+            st["editing"] = None
             save_db(db)
         await safe_edit(q, "Удалено. Выбери действие:", reply_markup=main_menu())
         return ConversationHandler.END
 
     if q.data.startswith("edit:"):
         idx = int(q.data.split(":")[1])
+        if not (0 <= idx < len(st["sections"])):
+            await safe_edit(q, "Секция не найдена.", reply_markup=main_menu())
+            return ConversationHandler.END
         st["editing"] = {"idx": idx, "field_i": 0}
         save_db(db)
+
         _, field_label = FIELDS[0]
         await safe_edit(
             q,
             f"Редактируем секцию {idx+1}.\n\nВведи: **{field_label}**",
             parse_mode="Markdown",
+            reply_markup=input_menu_kb(),
         )
         return ASK_VALUE
 
@@ -231,26 +305,28 @@ async def on_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = load_db()
     st = get_user_state(db, update.effective_user.id)
     editing = st.get("editing")
+
     if not editing:
         await update.message.reply_text("Выбери действие:", reply_markup=main_menu())
         return ConversationHandler.END
 
     idx = editing["idx"]
     field_i = editing["field_i"]
+
     if idx >= len(st["sections"]):
         st["editing"] = None
         save_db(db)
         await update.message.reply_text("Секция не найдена. Меню:", reply_markup=main_menu())
         return ConversationHandler.END
 
-    key, _label = FIELDS[field_i]
+    key, label = FIELDS[field_i]
     raw = update.message.text.strip()
 
     # Валидация
     if key == "extra_section":
         b = parse_bool_ru(raw)
         if b is None:
-            await update.message.reply_text("Введи **да** или **нет**.")
+            await update.message.reply_text("Введи **да** или **нет**.", parse_mode="Markdown", reply_markup=input_menu_kb())
             return ASK_VALUE
         st["sections"][idx][key] = b
     else:
@@ -260,7 +336,7 @@ async def on_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raise ValueError
             st["sections"][idx][key] = val
         except ValueError:
-            await update.message.reply_text("Нужно целое число (например: 2000).")
+            await update.message.reply_text("Нужно целое число (например: 2000).", reply_markup=input_menu_kb())
             return ASK_VALUE
 
     # Следующее поле
@@ -278,8 +354,13 @@ async def on_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     st["editing"]["field_i"] = field_i
     save_db(db)
+
     _, next_label = FIELDS[field_i]
-    await update.message.reply_text(f"Теперь введи: **{next_label}**", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"Теперь введи: **{next_label}**",
+        parse_mode="Markdown",
+        reply_markup=input_menu_kb(),  # ✅ кнопки всегда видны
+    )
     return ASK_VALUE
 
 
@@ -292,7 +373,10 @@ def build_app(token: str) -> Application:
             CallbackQueryHandler(on_menu_click),
         ],
         states={
-            ASK_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_value)],
+            ASK_VALUE: [
+                CallbackQueryHandler(on_menu_click),  # ✅ чтобы работали Назад/Сброс во время ввода
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_value),
+            ],
         },
         fallbacks=[CommandHandler("start", start)],
         allow_reentry=True,
